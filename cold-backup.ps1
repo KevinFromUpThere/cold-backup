@@ -316,16 +316,19 @@ ORDER BY type
 
     foreach ($r in $rows) {
         $pct     = if ($r.total -gt 0) { [int]($r.backed_up / $r.total * 100) } else { 0 }
-        $backed  = if ($r.backed_bytes) { $r.backed_bytes } else { 0 }
+        $backed  = if ($r.backed_bytes) { [long]$r.backed_bytes } else { 0L }
+        $totalGB = [math]::Round([long]$r.total_bytes / 1GB, 1)
+        $backGB  = [math]::Round($backed / 1GB, 1)
         Write-Host ("{0,-8}  {1,7}  {2,9:F1}G  {3,7}%    {4,9:F1}G" -f `
-            $r.type, $r.total, $r.total_bytes / 1GB, $pct, $backed / 1GB)
+            $r.type, $r.total, $totalGB, $pct, $backGB)
     }
 
-    $rem = Invoke-SqliteQuery -DataSource $script:DbPath -Query `
+    $rem     = Invoke-SqliteQuery -DataSource $script:DbPath -Query `
         'SELECT COUNT(*) AS c, SUM(size_bytes) AS s FROM files WHERE archived = 0'
-    $remBytes = if ($rem.s) { $rem.s } else { 0 }
+    $remCnt  = [int]$rem.c
+    $remGB   = [math]::Round($(if ($rem.s) { [long]$rem.s } else { 0L }) / 1GB, 1)
     Write-Host ('-' * 54)
-    Write-Host ("Remaining : {0,7} files  {1:F1} GB" -f $rem.c, $remBytes / 1GB) -ForegroundColor Yellow
+    Write-Host ("Remaining : {0,7} files  {1:F1} GB" -f $remCnt, $remGB) -ForegroundColor Yellow
 
     $drives = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query 'SELECT * FROM drives ORDER BY label')
     if ($drives.Count -gt 0) {
