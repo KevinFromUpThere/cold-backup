@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -108,56 +108,67 @@ function Invoke-Scan {
         'SELECT COUNT(*) AS c FROM files').c
     $totalFiles  = 0
 
-    foreach ($lib in $script:Libraries) {
-        if (-not (Test-Path $lib.Path)) {
-            Write-Warning "  Skipping (not accessible): $($lib.Path)"
-            continue
-        }
-        Write-Host "  [$($lib.Label)] $($lib.Path)" -ForegroundColor Gray
+    # A persistent connection is required so that BEGIN/INSERT/COMMIT all share
+    # the same SQLite connection. Invoke-SqliteQuery -DataSource opens a new
+    # connection per call, which discards transaction state between calls.
+    $conn = New-SQLiteConnection -DataSource $script:DbPath
 
-        $files         = Get-ChildItem -Path $lib.Path -Recurse -File -ErrorAction SilentlyContinue
-        $batchCount    = 0
-        $inTransaction = $false
+    try {
+        foreach ($lib in $script:Libraries) {
+            if (-not (Test-Path $lib.Path)) {
+                Write-Warning "  Skipping (not accessible): $($lib.Path)"
+                continue
+            }
+            Write-Host "  [$($lib.Label)] $($lib.Path)" -ForegroundColor Gray
 
-        try {
-            foreach ($f in $files) {
-                $totalFiles++
-                $batchCount++
+            $files      = Get-ChildItem -Path $lib.Path -Recurse -File -ErrorAction SilentlyContinue
+            $batchCount = 0
+            $inTx       = $false
 
-                if (-not $inTransaction) {
-                    Invoke-SqliteQuery -DataSource $script:DbPath -Query 'BEGIN TRANSACTION'
-                    $inTransaction = $true
-                }
+            try {
+                foreach ($f in $files) {
+                    $totalFiles++
+                    $batchCount++
 
-                Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
+                    if (-not $inTx) {
+                        Invoke-SqliteQuery -SQLiteConnection $conn -Query 'BEGIN TRANSACTION'
+                        $inTx = $true
+                    }
+
+                    Invoke-SqliteQuery -SQLiteConnection $conn -Query @'
 INSERT OR IGNORE INTO files (source_path, filename, type, library, size_bytes, modified)
 VALUES (@p, @n, @t, @l, @s, @m)
 '@ -SqlParameters @{
-                    p = $f.FullName
-                    n = $f.Name
-                    t = $lib.Type
-                    l = $lib.Label
-                    s = $f.Length
-                    m = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
-                }
+                        p = $f.FullName
+                        n = $f.Name
+                        t = $lib.Type
+                        l = $lib.Label
+                        s = $f.Length
+                        m = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+                    }
 
-                if ($batchCount -ge 500) {
-                    Invoke-SqliteQuery -DataSource $script:DbPath -Query 'COMMIT'
-                    $inTransaction = $false
-                    $batchCount    = 0
-                    Write-Host "    $totalFiles files scanned..." -ForegroundColor DarkGray
+                    if ($batchCount -ge 500) {
+                        Invoke-SqliteQuery -SQLiteConnection $conn -Query 'COMMIT'
+                        $inTx       = $false
+                        $batchCount = 0
+                        Write-Host "    $totalFiles files scanned..." -ForegroundColor DarkGray
+                    }
                 }
+                if ($inTx) {
+                    Invoke-SqliteQuery -SQLiteConnection $conn -Query 'COMMIT'
+                    $inTx = $false
+                }
+            } catch {
+                if ($inTx) {
+                    Invoke-SqliteQuery -SQLiteConnection $conn -Query 'ROLLBACK' -ErrorAction SilentlyContinue
+                    $inTx = $false
+                }
+                Write-Error "Error scanning $($lib.Path): $_"
             }
-            if ($inTransaction) {
-                Invoke-SqliteQuery -DataSource $script:DbPath -Query 'COMMIT'
-                $inTransaction = $false
-            }
-        } catch {
-            if ($inTransaction) {
-                Invoke-SqliteQuery -DataSource $script:DbPath -Query 'ROLLBACK' -ErrorAction SilentlyContinue
-            }
-            Write-Error "Error scanning $($lib.Path): $_"
         }
+    } finally {
+        $conn.Close()
+        $conn.Dispose()
     }
 
     $afterCount = (Invoke-SqliteQuery -DataSource $script:DbPath -Query `
