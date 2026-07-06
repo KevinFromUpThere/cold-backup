@@ -190,8 +190,9 @@ function Start-Backup {
 
     Write-Host "`nConnected backup drives:" -ForegroundColor Cyan
     foreach ($d in $drives) {
-        Write-Host ("  {0}  {1,-12}  {2:F1} GB free of {3:F1} GB" -f `
-            $d.Letter, $d.Label, $d.FreeBytes / 1GB, $d.TotalBytes / 1GB)
+        $freeGB  = [math]::Round($d.FreeBytes  / 1GB, 1)
+        $totalGB = [math]::Round($d.TotalBytes / 1GB, 1)
+        Write-Host ("  {0}  {1,-12}  {2:F1} GB free of {3:F1} GB" -f $d.Letter, $d.Label, $freeGB, $totalGB)
     }
 
     $grandTotal = 0
@@ -207,16 +208,19 @@ function Start-Backup {
             return
         }
 
-        $pendingGB = ($pending | Measure-Object -Property size_bytes -Sum).Sum / 1GB
-        Write-Host ("`nCopying to {0} ({1})  — {2:F1} GB free, {3} pending files ({4:F1} GB)..." -f `
-            $drive.Letter, $drive.Label, $drive.FreeBytes / 1GB, $pending.Count, $pendingGB) -ForegroundColor Cyan
+        $pendingGB  = [math]::Round(($pending | Measure-Object -Property size_bytes -Sum).Sum / 1GB, 1)
+        $driveFreeGB = [math]::Round($drive.FreeBytes / 1GB, 1)
+        Write-Host ("`nCopying to {0} ({1})  - {2:F1} GB free, {3} pending files ({4:F1} GB)..." -f `
+            $drive.Letter, $drive.Label, $driveFreeGB, $pending.Count, $pendingGB) -ForegroundColor Cyan
 
-        # Register drive in index
+        # Register drive in index — INSERT OR REPLACE handles both first-use and reconnect
         Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
-INSERT INTO drives (label, letter, total_bytes, first_used, last_used)
+INSERT OR IGNORE INTO drives (label, letter, total_bytes, first_used, last_used)
 VALUES (@label, @letter, @total, datetime('now'), datetime('now'))
-ON CONFLICT(label) DO UPDATE SET letter = excluded.letter, last_used = excluded.last_used
 '@ -SqlParameters @{ label = $drive.Label; letter = $drive.Letter; total = $drive.TotalBytes }
+        Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
+UPDATE drives SET letter = @letter, last_used = datetime('now') WHERE label = @label
+'@ -SqlParameters @{ label = $drive.Label; letter = $drive.Letter }
 
         $driveCopied = 0
         $driveBytes  = 0
@@ -265,28 +269,30 @@ WHERE id = @id
                 $grandBytes += $file.size_bytes
 
                 if ($driveCopied % 25 -eq 0) {
+                    $progressGB = [math]::Round($driveBytes / 1GB, 2)
                     Write-Host ("    {0} files | {1:F2} GB copied to this drive" -f `
-                        $driveCopied, $driveBytes / 1GB) -ForegroundColor DarkGray
+                        $driveCopied, $progressGB) -ForegroundColor DarkGray
                 }
             } catch {
                 Write-Warning "  Failed to copy $($file.filename): $_"
             }
         }
 
+        $driveWrittenGB = [math]::Round($driveBytes / 1GB, 2)
         Write-Host ("  Done with {0}: {1} files, {2:F2} GB written." -f `
-            $drive.Label, $driveCopied, $driveBytes / 1GB) -ForegroundColor Green
+            $drive.Label, $driveCopied, $driveWrittenGB) -ForegroundColor Green
     }
 
-    Write-Host ("`nSession complete: {0} files, {1:F2} GB archived." -f `
-        $grandTotal, $grandBytes / 1GB) -ForegroundColor Cyan
+    $sessionGB = [math]::Round($grandBytes / 1GB, 2)
+    Write-Host ("`nSession complete: {0} files, {1:F2} GB archived." -f $grandTotal, $sessionGB) -ForegroundColor Cyan
 
     # Show what's still pending after this session
     $rem = Invoke-SqliteQuery -DataSource $script:DbPath -Query `
         'SELECT COUNT(*) AS c, SUM(size_bytes) AS s FROM files WHERE archived = 0'
     if ($rem.c -gt 0) {
-        $remBytes = if ($rem.s) { $rem.s } else { 0 }
-        Write-Host ("Still pending: {0} files ({1:F1} GB) — insert more drives to continue." -f `
-            $rem.c, $remBytes / 1GB) -ForegroundColor Yellow
+        $remGB = [math]::Round($(if ($rem.s) { [long]$rem.s } else { 0L }) / 1GB, 1)
+        Write-Host ("Still pending: {0} files ({1:F1} GB) - insert more drives to continue." -f `
+            $rem.c, $remGB) -ForegroundColor Yellow
     }
 }
 
