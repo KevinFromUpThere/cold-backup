@@ -115,14 +115,19 @@ function Invoke-Scan {
         }
         Write-Host "  [$($lib.Label)] $($lib.Path)" -ForegroundColor Gray
 
-        $files      = Get-ChildItem -Path $lib.Path -Recurse -File -ErrorAction SilentlyContinue
-        $batchCount = 0
+        $files         = Get-ChildItem -Path $lib.Path -Recurse -File -ErrorAction SilentlyContinue
+        $batchCount    = 0
+        $inTransaction = $false
 
-        Invoke-SqliteQuery -DataSource $script:DbPath -Query 'BEGIN TRANSACTION'
         try {
             foreach ($f in $files) {
                 $totalFiles++
                 $batchCount++
+
+                if (-not $inTransaction) {
+                    Invoke-SqliteQuery -DataSource $script:DbPath -Query 'BEGIN TRANSACTION'
+                    $inTransaction = $true
+                }
 
                 Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
 INSERT OR IGNORE INTO files (source_path, filename, type, library, size_bytes, modified)
@@ -138,14 +143,19 @@ VALUES (@p, @n, @t, @l, @s, @m)
 
                 if ($batchCount -ge 500) {
                     Invoke-SqliteQuery -DataSource $script:DbPath -Query 'COMMIT'
-                    Invoke-SqliteQuery -DataSource $script:DbPath -Query 'BEGIN TRANSACTION'
-                    $batchCount = 0
+                    $inTransaction = $false
+                    $batchCount    = 0
                     Write-Host "    $totalFiles files scanned..." -ForegroundColor DarkGray
                 }
             }
-            Invoke-SqliteQuery -DataSource $script:DbPath -Query 'COMMIT'
+            if ($inTransaction) {
+                Invoke-SqliteQuery -DataSource $script:DbPath -Query 'COMMIT'
+                $inTransaction = $false
+            }
         } catch {
-            Invoke-SqliteQuery -DataSource $script:DbPath -Query 'ROLLBACK' -ErrorAction SilentlyContinue
+            if ($inTransaction) {
+                Invoke-SqliteQuery -DataSource $script:DbPath -Query 'ROLLBACK' -ErrorAction SilentlyContinue
+            }
             Write-Error "Error scanning $($lib.Path): $_"
         }
     }
