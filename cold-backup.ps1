@@ -267,17 +267,20 @@ WHERE id = @id
                 $driveBytes += $file.size_bytes
                 $grandTotal++
                 $grandBytes += $file.size_bytes
-
-                $fileMB      = [math]::Round($file.size_bytes / 1MB, 1)
-                $driveGB     = [math]::Round($driveBytes / 1GB, 2)
-                $grandGB     = [math]::Round($grandBytes / 1GB, 2)
-                $name        = $file.filename
-                if ($name.Length -gt 55) { $name = $name.Substring(0, 52) + '...' }
-                Write-Host ("  [{0,5}] {1,-55} {2,7:F1} MB  |  drive: {3:F2} GB  session: {4:F2} GB" -f `
-                    $driveCopied, $name, $fileMB, $driveGB, $grandGB) -ForegroundColor DarkGray
             } catch {
                 Write-Warning "  Failed to copy $($file.filename): $_"
+                continue
             }
+
+            # Progress line is outside the copy try/catch so display errors can't
+            # be mistaken for copy failures
+            $fileMB  = [math]::Round($file.size_bytes / 1MB, 1)
+            $driveGB = [math]::Round($driveBytes / 1GB, 2)
+            $grandGB = [math]::Round($grandBytes / 1GB, 2)
+            $name    = $file.filename
+            if ($name.Length -gt 55) { $name = $name.Substring(0, 52) + '...' }
+            Write-Host ("  [{0,5}] {1,-55} {2,7:F1} MB  |  drive: {3:F2} GB  session: {4:F2} GB" -f `
+                $driveCopied, $name, $fileMB, $driveGB, $grandGB) -ForegroundColor DarkGray
         }
 
         $driveWrittenGB = [math]::Round($driveBytes / 1GB, 2)
