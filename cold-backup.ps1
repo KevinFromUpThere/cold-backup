@@ -201,7 +201,7 @@ function Start-Backup {
     foreach ($drive in $drives) {
         # Re-query each drive pass so newly archived files are excluded
         $pending = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query `
-            'SELECT * FROM files WHERE archived = 0 ORDER BY type, size_bytes DESC')
+            'SELECT * FROM files WHERE archived = 0 ORDER BY type, source_path')
 
         if ($pending.Count -eq 0) {
             Write-Host "`nAll files are archived — nothing left to copy!" -ForegroundColor Green
