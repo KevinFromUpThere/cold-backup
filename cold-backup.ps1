@@ -15,7 +15,8 @@
     .\cold-backup.ps1 search "Avatar"   # Find a file or show
     .\cold-backup.ps1 drives            # List connected backup drives
     .\cold-backup.ps1 init-drive G:     # Format and label a new blank drive
-    .\cold-backup.ps1 verify            # Check that archived files still exist on drives
+    .\cold-backup.ps1 verify            # Check that archived files still exist on drives (size only)
+    .\cold-backup.ps1 verify full       # Same, plus SHA-256 hash comparison (slower)
 #>
 
 param(
@@ -72,17 +73,24 @@ function Initialize-Database {
 
     Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
 CREATE TABLE IF NOT EXISTS files (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_path TEXT    NOT NULL UNIQUE,
-    filename    TEXT    NOT NULL,
-    type        TEXT    NOT NULL,
-    library     TEXT    NOT NULL,
-    size_bytes  INTEGER NOT NULL DEFAULT 0,
-    modified    TEXT    NOT NULL,
-    archived    INTEGER NOT NULL DEFAULT 0,
-    drive_label TEXT,
-    drive_path  TEXT,
-    archived_at TEXT
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_path      TEXT    NOT NULL UNIQUE,
+    filename         TEXT    NOT NULL,
+    type             TEXT    NOT NULL,
+    library          TEXT    NOT NULL,
+    size_bytes       INTEGER NOT NULL DEFAULT 0,
+    modified         TEXT    NOT NULL,
+    show_name        TEXT,
+    season_number    INTEGER,
+    container        TEXT,
+    resolution       TEXT,
+    archived         INTEGER NOT NULL DEFAULT 0,
+    drive_label      TEXT,
+    drive_path       TEXT,
+    archived_at      TEXT,
+    checksum         TEXT,
+    last_verified_at TEXT,
+    verify_status    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_archived ON files(archived);
 CREATE INDEX IF NOT EXISTS idx_type     ON files(type);
@@ -97,6 +105,38 @@ CREATE TABLE IF NOT EXISTS drives (
     last_used   TEXT
 );
 '@
+}
+
+
+# ── Media metadata parsing ────────────────────────────────────────────────────
+# Best-effort parsing from path/filename conventions — no ffprobe, so it's free
+# to run against all ~42k files during scan. Falls back to $null on no match.
+function Get-TVShowInfo {
+    param([string]$RelativePath)
+
+    $segments = $RelativePath -split '[\\/]'
+    $show     = $segments[0]
+    $season   = $null
+
+    foreach ($seg in $segments) {
+        if ($seg -match '(?i)season\s*(\d+)') { $season = [int]$Matches[1]; break }
+    }
+    if (-not $season -and $RelativePath -match '(?i)S(\d{1,2})E\d{1,3}') {
+        $season = [int]$Matches[1]
+    }
+
+    [PSCustomObject]@{ ShowName = $show; SeasonNumber = $season }
+}
+
+function Get-Resolution {
+    param([string]$FileName)
+
+    if ($FileName -match '(?i)\b(2160p|4k|1080p|720p|480p|576p)\b') {
+        $res = $Matches[1].ToLower()
+        if ($res -eq '4k') { return '2160p' }
+        return $res
+    }
+    return $null
 }
 
 
@@ -135,16 +175,29 @@ function Invoke-Scan {
                         $inTx = $true
                     }
 
+                    $showName = $null
+                    $seasonNum = $null
+                    if ($lib.Type -eq 'TV') {
+                        $rel  = $f.FullName.Substring($lib.Path.Length).TrimStart('\', '/')
+                        $info = Get-TVShowInfo -RelativePath $rel
+                        $showName  = $info.ShowName
+                        $seasonNum = $info.SeasonNumber
+                    }
+
                     Invoke-SqliteQuery -SQLiteConnection $conn -Query @'
-INSERT OR IGNORE INTO files (source_path, filename, type, library, size_bytes, modified)
-VALUES (@p, @n, @t, @l, @s, @m)
+INSERT OR IGNORE INTO files (source_path, filename, type, library, size_bytes, modified, show_name, season_number, container, resolution)
+VALUES (@p, @n, @t, @l, @s, @m, @sh, @se, @c, @r)
 '@ -SqlParameters @{
-                        p = $f.FullName
-                        n = $f.Name
-                        t = $lib.Type
-                        l = $lib.Label
-                        s = $f.Length
-                        m = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+                        p  = $f.FullName
+                        n  = $f.Name
+                        t  = $lib.Type
+                        l  = $lib.Label
+                        s  = $f.Length
+                        m  = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+                        sh = $showName
+                        se = $seasonNum
+                        c  = $f.Extension.TrimStart('.').ToLower()
+                        r  = (Get-Resolution -FileName $f.Name)
                     }
 
                     if ($batchCount -ge 500) {
@@ -256,19 +309,20 @@ UPDATE drives SET letter = @letter, last_used = datetime('now') WHERE label = @l
                     New-Item -ItemType Directory -Path $destDir -Force | Out-Null
                 }
                 Copy-Item -LiteralPath $file.source_path -Destination $dest -Force -ErrorAction Stop
+                $hash = (Get-FileHash -LiteralPath $dest -Algorithm SHA256 -ErrorAction Stop).Hash
 
                 Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
 UPDATE files
-SET archived = 1, drive_label = @label, drive_path = @path, archived_at = datetime('now')
+SET archived = 1, drive_label = @label, drive_path = @path, archived_at = datetime('now'), checksum = @hash
 WHERE id = @id
-'@ -SqlParameters @{ label = $drive.Label; path = $dest; id = $file.id }
+'@ -SqlParameters @{ label = $drive.Label; path = $dest; id = $file.id; hash = $hash }
 
                 $driveCopied++
                 $driveBytes += $file.size_bytes
                 $grandTotal++
                 $grandBytes += $file.size_bytes
             } catch {
-                Write-Warning "  Failed to copy $($file.filename): $_"
+                Write-Warning "  Failed to copy/hash $($file.filename): $_"
                 continue
             }
 
@@ -366,10 +420,11 @@ function Search-Files {
     }
 
     $results = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
-SELECT filename, type, library, size_bytes, archived, drive_label, drive_path, source_path
+SELECT filename, type, library, size_bytes, archived, drive_label, drive_path, source_path,
+       show_name, season_number, container, resolution
 FROM files
-WHERE filename LIKE @q OR source_path LIKE @q
-ORDER BY type, filename
+WHERE filename LIKE @q OR source_path LIKE @q OR show_name LIKE @q
+ORDER BY type, show_name, season_number, filename
 LIMIT 100
 '@ -SqlParameters @{ q = "%$Query%" })
 
@@ -383,11 +438,13 @@ LIMIT 100
 
     foreach ($r in $results) {
         $sizeMB = [math]::Round($r.size_bytes / 1MB, 1)
+        $tags   = (@($r.container, $r.resolution) | Where-Object { $_ }) -join ' '
+        $show   = if ($r.show_name) { "  ($($r.show_name)$(if ($r.season_number) { " S$('{0:D2}' -f $r.season_number)" }))" } else { '' }
         if ($r.archived) {
-            Write-Host "  [OK] $($r.filename)  [$($r.type)]  ${sizeMB} MB" -ForegroundColor Green
+            Write-Host "  [OK] $($r.filename)  [$($r.type)]  ${sizeMB} MB  $tags$show" -ForegroundColor Green
             Write-Host "       Drive: $($r.drive_label)  →  $($r.drive_path)" -ForegroundColor DarkGray
         } else {
-            Write-Host "  [--] $($r.filename)  [$($r.type)]  ${sizeMB} MB  NOT BACKED UP" -ForegroundColor Yellow
+            Write-Host "  [--] $($r.filename)  [$($r.type)]  ${sizeMB} MB  $tags$show  NOT BACKED UP" -ForegroundColor Yellow
             Write-Host "       Source: $($r.source_path)" -ForegroundColor DarkGray
         }
     }
@@ -473,7 +530,13 @@ function Initialize-BackupDrive {
 
 
 # ── Verify ────────────────────────────────────────────────────────────────────
+# Default mode is a fast sanity check (existence + size). Pass -Full to also
+# recompute and compare the SHA-256 recorded at backup time — this rereads
+# every file end-to-end, so it's much slower and meant for occasional use,
+# not every verify run.
 function Invoke-Verify {
+    param([switch]$Full)
+
     $drives = @(Get-OfflineDrives)
     if ($drives.Count -eq 0) {
         Write-Warning "No OFFLINE_ drives connected. Insert drives to verify."
@@ -481,10 +544,11 @@ function Invoke-Verify {
     }
 
     $driveLabels = $drives.Label
-    Write-Host "`nVerifying files on: $($driveLabels -join ', ')..." -ForegroundColor Cyan
+    $mode = if ($Full) { 'full (size + hash)' } else { 'fast (size only)' }
+    Write-Host "`nVerifying files on: $($driveLabels -join ', ')  [$mode]..." -ForegroundColor Cyan
 
     $archived = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
-SELECT id, filename, size_bytes, drive_label, drive_path
+SELECT id, filename, size_bytes, drive_label, drive_path, checksum
 FROM files
 WHERE archived = 1 AND drive_label IN (SELECT label FROM drives)
 '@)
@@ -507,23 +571,39 @@ WHERE archived = 1 AND drive_label IN (SELECT label FROM drives)
         $checked++
         if ($checked % 100 -eq 0) { Write-Host "  $checked / $($toCheck.Count)..." -ForegroundColor DarkGray }
 
+        $status = 'ok'
+
         if (-not (Test-Path -LiteralPath $f.drive_path)) {
             Write-Warning "  MISSING: $($f.drive_path)"
             $missing++
-            continue
+            $status = 'missing'
+        } else {
+            $actual = (Get-Item -LiteralPath $f.drive_path).Length
+            if ($actual -ne $f.size_bytes) {
+                Write-Warning ("  SIZE MISMATCH: {0}  expected {1} bytes, got {2}" -f `
+                    $f.drive_path, $f.size_bytes, $actual)
+                $wrong++
+                $status = 'size_mismatch'
+            } elseif ($Full -and $f.checksum) {
+                $actualHash = (Get-FileHash -LiteralPath $f.drive_path -Algorithm SHA256).Hash
+                if ($actualHash -ne $f.checksum) {
+                    Write-Warning "  HASH MISMATCH: $($f.drive_path)"
+                    $wrong++
+                    $status = 'hash_mismatch'
+                } else {
+                    $ok++
+                }
+            } else {
+                $ok++
+            }
         }
 
-        $actual = (Get-Item -LiteralPath $f.drive_path).Length
-        if ($actual -ne $f.size_bytes) {
-            Write-Warning ("  SIZE MISMATCH: {0}  expected {1} bytes, got {2}" -f `
-                $f.drive_path, $f.size_bytes, $actual)
-            $wrong++
-        } else {
-            $ok++
-        }
+        Invoke-SqliteQuery -DataSource $script:DbPath -Query @'
+UPDATE files SET last_verified_at = datetime('now'), verify_status = @status WHERE id = @id
+'@ -SqlParameters @{ status = $status; id = $f.id }
     }
 
-    Write-Host ("`nVerify complete: {0} OK  {1} missing  {2} size mismatch" -f $ok, $missing, $wrong) -ForegroundColor Cyan
+    Write-Host ("`nVerify complete: {0} OK  {1} missing  {2} mismatch" -f $ok, $missing, $wrong) -ForegroundColor Cyan
     if ($missing -gt 0 -or $wrong -gt 0) {
         Write-Host "Run 'backup' to re-copy any problem files." -ForegroundColor Yellow
     }
@@ -541,6 +621,6 @@ switch ($Command) {
     'search'     { Search-Files -Query ($Arguments -join ' ') }
     'drives'     { Show-Drives }
     'init-drive' { Initialize-BackupDrive -DriveLetter ($Arguments | Select-Object -First 1) }
-    'verify'     { Invoke-Verify }
+    'verify'     { Invoke-Verify -Full:($Arguments -contains 'full') }
     default      { Show-Status }
 }
